@@ -26,6 +26,13 @@ log = logging.getLogger(__name__)
 LOG_DIR = _paths.log_dir()
 DEFAULT_SLOW_OPTIMIZATION_MS = 500.0
 
+# The default port's log keeps its legacy unsuffixed name (proxy.log,
+# proxy.log.1, ...); every other port gets proxy.<port>.log[.N] — see
+# paths.proxy_log_path(). Both patterns are globbed so a workspace shared by
+# multiple `install apply` profiles (issue #3421) still has every profile's
+# log aggregated here, not just the default port's.
+_PROXY_LOG_GLOB_PATTERNS = ("proxy.log*", "proxy.[0-9]*.log*")
+
 # Matches: 2026-03-07 13:38:31,009 - headroom.proxy - INFO - [hr_...] PERF model=... ...
 _PERF_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+) .* \[(?P<rid>[^\]]+)\] PERF (?P<kv>.+)$"
@@ -313,7 +320,8 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
         if report.newest_kept_ts is None or ts_str > report.newest_kept_ts:
             report.newest_kept_ts = ts_str
 
-    # Collect log files: proxy.log, proxy.log.1, proxy.log.2, ...
+    # Collect log files: proxy.log, proxy.log.1, proxy.log.2, ... plus every
+    # non-default port's proxy.<port>.log[.N] (see _PROXY_LOG_GLOB_PATTERNS).
     #
     # A rotated file last written before the cutoff cannot contain a record
     # inside the window, so skip it without opening it. Without this the cost
@@ -328,7 +336,10 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
     # are stat'd once and the value reused for the sort.
     cutoff_epoch = cutoff.timestamp() if cutoff is not None else None
     dated_files: list[tuple[float, Path]] = []
-    for path in log_dir.glob("proxy.log*"):
+    matched_paths: set[Path] = set()
+    for pattern in _PROXY_LOG_GLOB_PATTERNS:
+        matched_paths.update(log_dir.glob(pattern))
+    for path in matched_paths:
         try:
             mtime = path.stat().st_mtime
         except OSError:

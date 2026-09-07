@@ -296,6 +296,61 @@ def test_unwindowed_parse_still_reads_every_rotated_log(monkeypatch, tmp_path):
     assert report.log_files_read == 2
 
 
+def test_parse_log_files_includes_non_default_port_logs(monkeypatch, tmp_path):
+    """`headroom perf` (and `/stats` throughput) must aggregate every
+    profile's log, not just the default port's.
+
+    Regression test for https://github.com/headroomlabs-ai/headroom/pull/3444
+    review feedback: giving each non-default port its own
+    `proxy.<port>.log` (issue #3421) silently dropped that data from
+    `parse_log_files`, which only globbed `proxy.log*`.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    now = datetime.now()
+    _write_log(log_dir / "proxy.log", _perf_line(now - timedelta(minutes=5), "default"), now)
+    _write_log(
+        log_dir / "proxy.8791.log",
+        _perf_line(now - timedelta(minutes=5), "openrouter"),
+        now,
+    )
+    _write_log(
+        log_dir / "proxy.8791.log.1",
+        _perf_line(now - timedelta(days=3), "openrouter-rotated"),
+        now - timedelta(days=3),
+    )
+    monkeypatch.setattr(analyzer, "LOG_DIR", log_dir)
+
+    report = analyzer.parse_log_files(last_n_hours=0)
+
+    assert {r.client for r in report.perf_records} == {
+        "default",
+        "openrouter",
+        "openrouter-rotated",
+    }
+    assert report.log_files_read == 3
+
+
+def test_parse_log_files_windowed_still_skips_stale_non_default_port_logs(monkeypatch, tmp_path):
+    """The mtime-based windowing optimization must also cover per-port logs."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    now = datetime.now()
+    _write_log(
+        log_dir / "proxy.8791.log.1",
+        _perf_line(now - timedelta(days=3), "stale"),
+        now - timedelta(days=3),
+    )
+    _write_log(log_dir / "proxy.8791.log", _perf_line(now - timedelta(minutes=5), "live"), now)
+    monkeypatch.setattr(analyzer, "LOG_DIR", log_dir)
+
+    report = analyzer.parse_log_files(last_n_hours=1.0)
+
+    assert [r.client for r in report.perf_records] == ["live"]
+    assert report.log_files_read == 1
+    assert report.log_files_skipped == 1
+
+
 def test_perf_csv_by_model(runner, monkeypatch):
     _patch_report(monkeypatch, _sample_report())
     result = runner.invoke(main, ["perf", "--format", "csv"])

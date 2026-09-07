@@ -65,7 +65,7 @@ class TestCLIWrapProxyTimeout:
 
         monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
         monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda _port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: sleeps.append(seconds))
         monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
@@ -82,7 +82,7 @@ class TestCLIWrapProxyTimeout:
 
         monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
         monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda _port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
@@ -115,7 +115,7 @@ class TestCLIWrapProxyTimeout:
         monkeypatch.setenv("GITHUB_COPILOT_API_TOKEN_EXPIRES_AT", "123")
         monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
         monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda _port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
 
@@ -145,7 +145,7 @@ class TestCLIWrapProxyTimeout:
         logs: list[str] = []
 
         monkeypatch.delenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, raising=False)
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda _port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: True)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(wrap_mod, "_ml_wrap_extras_detected", lambda: False)
@@ -171,7 +171,7 @@ class TestCLIWrapProxyTimeout:
         checks = []
 
         monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "4")
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda _port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda seconds: sleeps.append(seconds))
         monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
 
@@ -196,7 +196,7 @@ class TestCLIWrapProxyTimeout:
         fake_proc.poll = lambda: fake_proc.returncode
 
         monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "2")
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda _port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
@@ -216,7 +216,7 @@ class TestCLIWrapProxyTimeout:
         fake_proc = _FakeProxyProcess()
 
         monkeypatch.setenv(wrap_mod._WRAP_PROXY_TIMEOUT_ENV, "2")
-        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda: tmp_path / "proxy.log")
+        monkeypatch.setattr(wrap_mod, "_get_log_path", lambda _port=None: tmp_path / "proxy.log")
         monkeypatch.setattr(wrap_mod, "_check_proxy", lambda _port: False)
         monkeypatch.setattr(wrap_mod.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(wrap_mod.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
