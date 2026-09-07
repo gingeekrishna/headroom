@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 from collections.abc import Mapping
 from typing import Any, cast
 
-from fastapi import WebSocket
+from fastapi import Request, WebSocket
+from fastapi.responses import Response
 
 from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
-from headroom.providers.codex.endpoints import codex_backend_ws_url
+from headroom.providers.codex.endpoints import codex_backend_url, codex_backend_ws_url
+from headroom.providers.codex.headers import drop_header
 from headroom.providers.codex.runtime import resolve_codex_routing
 from headroom.proxy.handlers.openai import _is_allowed_websocket_origin
 from headroom.proxy.helpers import _strip_internal_headers, merge_extra_headers
@@ -28,6 +31,7 @@ CODEX_LIVE_ROUTE_PATHS: tuple[str, ...] = (
 )
 CODEX_LIVE_WS_PATH_ENV = "HEADROOM_CODEX_LIVE_WS_PATH"
 DEFAULT_CODEX_LIVE_WS_PATH = "/live"
+CODEX_LIVE_CALLS_QUERY = "intent=quicksilver&architecture=avas"
 
 
 def codex_live_ws_path() -> str:
@@ -68,6 +72,49 @@ def _ensure_live_authorization(headers: Mapping[str, str]) -> dict[str, str]:
     if not api_key:
         return dict(headers)
     return {**headers, "Authorization": f"Bearer {api_key}"}
+
+
+async def handle_codex_live_http(
+    request: Request,
+    http_client: Any,
+    openai_base_url: str,
+    inbound_path: str,
+) -> Response | None:
+    """Forward ChatGPT Codex Live call creation over HTTP."""
+    upstream_headers = dict(request.headers.items())
+    drop_header(upstream_headers, "host")
+    drop_header(upstream_headers, "accept-encoding")
+    form = await request.form()
+    sdp = form.get("sdp")
+    session = form.get("session")
+    if not isinstance(sdp, str) or not isinstance(session, str):
+        return Response(content="Missing sdp or session form field.", status_code=400)
+    try:
+        session_payload = json.loads(session)
+    except json.JSONDecodeError:
+        return Response(content="Invalid session JSON.", status_code=400)
+
+    drop_header(upstream_headers, "content-length")
+    drop_header(upstream_headers, "content-type")
+    decision = resolve_codex_routing(upstream_headers)
+    if not decision.is_chatgpt_auth:
+        return None
+    try:
+        response = await http_client.request(
+            "POST",
+            codex_backend_url("/realtime/calls", CODEX_LIVE_CALLS_QUERY),
+            headers=decision.headers,
+            json={"sdp": sdp, "session": session_payload},
+            timeout=120.0,
+        )
+    except Exception:
+        logger.exception("Codex Live HTTP call creation failed path=%s", inbound_path)
+        return Response(content="Upstream request failed.", status_code=502)
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=dict(response.headers),
+    )
 
 
 _NON_WIRE_CLOSE_CODES = {1004, 1005, 1006, 1015}

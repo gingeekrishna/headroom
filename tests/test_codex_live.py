@@ -26,6 +26,7 @@ from headroom.providers.codex.live import (
     _forward_headers,
     codex_live_websocket_url,
     codex_live_ws_path,
+    handle_codex_live_http,
     handle_codex_live_websocket,
 )
 from headroom.providers.codex.runtime import resolve_codex_routing
@@ -105,6 +106,60 @@ def test_live_auth_modes_and_derived_paths(monkeypatch) -> None:
         )
         == "wss://chatgpt.com/backend-api/codex/custom/live?mode=live"
     )
+
+
+@pytest.mark.asyncio
+async def test_live_http_call_creation_forwards_json_and_location() -> None:
+    token = _jwt(
+        {
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct-live"},
+        }
+    )
+
+    class FakeRequest:
+        headers = {
+            "authorization": f"Bearer {token}",
+            "host": "proxy.test",
+            "content-length": "123",
+            "content-type": "multipart/form-data; boundary=test",
+        }
+
+        async def form(self):  # type: ignore[no-untyped-def]
+            return {"sdp": "v=0", "session": '{"type":"realtime"}'}
+
+    class FakeHttpClient:
+        def __init__(self) -> None:
+            self.call: tuple[str, str, dict[str, str], dict[str, object]] | None = None
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.call = (method, url, dict(kwargs["headers"]), kwargs["json"])
+            return SimpleNamespace(
+                content=b'{"ok":true}',
+                status_code=201,
+                headers={"Location": "/backend-api/codex/realtime/calls/1"},
+            )
+
+    client = FakeHttpClient()
+    response = await handle_codex_live_http(
+        FakeRequest(),
+        client,
+        "https://api.openai.test",
+        "/v1/live",
+    )
+
+    assert client.call == (
+        "POST",
+        "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas",
+        {
+            "authorization": f"Bearer {token}",
+            "ChatGPT-Account-ID": "acct-live",
+        },
+        {"sdp": "v=0", "session": {"type": "realtime"}},
+    )
+    assert response is not None
+    assert response.status_code == 201
+    assert response.headers["Location"] == "/backend-api/codex/realtime/calls/1"
+    assert response.body == b'{"ok":true}'
 
 
 def test_live_headers_strip_internal_and_handshake_headers_without_beta_injection() -> None:
