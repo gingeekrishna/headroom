@@ -5062,7 +5062,15 @@ class ContentRouter(Transform):
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
                 if collect_diagnostics:
-                    _diag[i] = "compressed:content_blocks"
+                    # _process_content_blocks returns the SAME message object
+                    # when it protected/passed through every block, and a NEW
+                    # dict only when at least one block was actually
+                    # compressed -- use that instead of assuming compression.
+                    _diag[i] = (
+                        "compressed:content_blocks"
+                        if transformed_message is not message
+                        else "protected:content_blocks_unchanged"
+                    )
                 continue
 
             # Skip non-string content (other types)
@@ -5655,15 +5663,17 @@ class ContentRouter(Transform):
                 slot = result_slots[idx] if idx < len(result_slots) else None
                 if slot is None:
                     continue
-                orig_content = orig_msg.get("content", "")
-                result_content = slot.get("content", "")
-                tok_before = (
-                    tokenizer.count_text(orig_content) if isinstance(orig_content, str) else 0
-                )
-                tok_after = (
-                    tokenizer.count_text(result_content) if isinstance(result_content, str) else 0
-                )
-                action = _diag.get(idx, "compressed:unknown")
+                # Delegates to the canonical block-aware counter (also used for
+                # net-cost estimation) so list/block content (Anthropic-style
+                # tool_result/text blocks) gets a real count instead of the 0
+                # a str-only check would give it.
+                tok_before = _netcost_message_tokens(orig_msg, tokenizer)
+                tok_after = _netcost_message_tokens(slot, tokenizer)
+                # "uninstrumented" (never "compressed:...") for any route that
+                # didn't tag `_diag`: claiming a compression that may not have
+                # happened is worse than admitting the diagnostic is incomplete
+                # for that path.
+                action = _diag.get(idx, "uninstrumented")
                 message_decisions.append(
                     MessageDecision(
                         message_index=idx,
