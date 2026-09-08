@@ -10,6 +10,7 @@
 import { compress } from "headroom-ai";
 import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
 import { agentToOpenAI, normalizeAgentMessages, openAIToAgent } from "./convert.js";
+import { DurableAdvancementKeyStore, defaultCommitLogPath } from "./advancement-key-store.js";
 
 /** Race a promise against a timeout and always release the timer. */
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -27,10 +28,10 @@ export interface HeadroomEngineConfig extends ProxyManagerConfig {
   requestTimeoutMs?: number;
   circuitBreakerThreshold?: number;
   circuitBreakerCooldownMs?: number;
+  /** Where to durably record committed turn-advancement keys (see
+   * `DurableAdvancementKeyStore`). Defaults to `defaultCommitLogPath()`. */
+  commitLogPath?: string;
 }
-
-/** Bound on tracked advancement keys so long-lived sessions can't grow this unbounded. */
-const MAX_TRACKED_ADVANCEMENT_KEYS = 512;
 
 export class HeadroomContextEngine {
   readonly info = {
@@ -44,8 +45,10 @@ export class HeadroomContextEngine {
     },
   };
 
-  // FIFO-bounded record of committed advancement keys, for commitTurn's idempotent-retry check.
-  private committedAdvancementKeys = new Set<string>();
+  // Durable, restart-safe record of committed advancement keys, for
+  // commitTurn's idempotent-retry check. See advancement-key-store.ts for
+  // why this must survive a process restart and must not evict entries.
+  private advancementKeyStore: DurableAdvancementKeyStore;
 
   private proxyManager: ProxyManager;
   private proxyUrl: string | null = null;
@@ -66,6 +69,9 @@ export class HeadroomContextEngine {
     this.config = config;
     this.logger = logger ?? defaultLogger;
     this.proxyManager = new ProxyManager(config, this.logger);
+    this.advancementKeyStore = new DurableAdvancementKeyStore(
+      config.commitLogPath ?? defaultCommitLogPath(),
+    );
   }
 
   // === ContextEngine Lifecycle ===
@@ -234,23 +240,15 @@ export class HeadroomContextEngine {
    * contract. Called only for the accepted, successful turn; failed or aborted
    * turns never reach here. Must be an atomic, idempotent write keyed by
    * `advancementKey` so a host retry with the same key reports "duplicate"
-   * instead of re-applying the advancement.
+   * instead of re-applying the advancement — including a retry that arrives
+   * after this process restarted, which is why the record lives on disk
+   * (see `DurableAdvancementKeyStore`) rather than in an in-memory Set.
    */
   async commitTurn(params: { advancementKey: string; messages: any[] }): Promise<{
     status: "committed" | "duplicate";
   }> {
-    if (this.committedAdvancementKeys.has(params.advancementKey)) {
-      return { status: "duplicate" };
-    }
-
-    if (this.committedAdvancementKeys.size >= MAX_TRACKED_ADVANCEMENT_KEYS) {
-      const oldest = this.committedAdvancementKeys.values().next().value;
-      if (oldest !== undefined) {
-        this.committedAdvancementKeys.delete(oldest);
-      }
-    }
-    this.committedAdvancementKeys.add(params.advancementKey);
-    return { status: "committed" };
+    const status = await this.advancementKeyStore.tryCommit(params.advancementKey);
+    return { status };
   }
 
   async afterTurn?(params: {

@@ -1,4 +1,8 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocked = vi.hoisted(() => ({
   start: vi.fn(async () => "http://127.0.0.1:8787"),
@@ -253,8 +257,20 @@ describe("HeadroomContextEngine proxy startup helpers", () => {
 });
 
 describe("HeadroomContextEngine transcriptSemantics contract", () => {
+  let commitLogDir: string;
+  let commitLogPath: string;
+
+  beforeEach(async () => {
+    commitLogDir = await fs.mkdtemp(path.join(os.tmpdir(), "headroom-commit-log-"));
+    commitLogPath = path.join(commitLogDir, "commit-log.json");
+  });
+
+  afterEach(async () => {
+    await fs.rm(commitLogDir, { recursive: true, force: true });
+  });
+
   it("declares the durable-commit transcript semantics OpenClaw requires", () => {
-    const engine = new HeadroomContextEngine();
+    const engine = new HeadroomContextEngine({ commitLogPath });
 
     expect(engine.info.transcriptSemantics).toEqual({
       currentTurnFence: "before-current-turn-entry-v1",
@@ -263,7 +279,7 @@ describe("HeadroomContextEngine transcriptSemantics contract", () => {
   });
 
   it("commits a new advancement key", async () => {
-    const engine = new HeadroomContextEngine();
+    const engine = new HeadroomContextEngine({ commitLogPath });
 
     await expect(
       engine.commitTurn({ advancementKey: "turn-1", messages: [] }),
@@ -271,7 +287,7 @@ describe("HeadroomContextEngine transcriptSemantics contract", () => {
   });
 
   it("reports duplicate on a retried advancement key", async () => {
-    const engine = new HeadroomContextEngine();
+    const engine = new HeadroomContextEngine({ commitLogPath });
 
     await expect(
       engine.commitTurn({ advancementKey: "turn-1", messages: [] }),
@@ -282,7 +298,7 @@ describe("HeadroomContextEngine transcriptSemantics contract", () => {
   });
 
   it("treats distinct advancement keys independently", async () => {
-    const engine = new HeadroomContextEngine();
+    const engine = new HeadroomContextEngine({ commitLogPath });
 
     await expect(
       engine.commitTurn({ advancementKey: "turn-1", messages: [] }),
@@ -292,20 +308,32 @@ describe("HeadroomContextEngine transcriptSemantics contract", () => {
     ).resolves.toEqual({ status: "committed" });
   });
 
-  it("bounds tracked advancement keys so long sessions cannot grow it unbounded", async () => {
-    const engine = new HeadroomContextEngine();
-    const cap = 512;
+  it("reports duplicate for a key committed before a process restart", async () => {
+    // Simulate a restart: a brand new engine instance (no shared in-memory
+    // state) pointed at the same durable commit-log path.
+    const before = new HeadroomContextEngine({ commitLogPath });
+    await expect(
+      before.commitTurn({ advancementKey: "turn-restart", messages: [] }),
+    ).resolves.toEqual({ status: "committed" });
 
-    for (let i = 0; i < cap + 1; i++) {
+    const after = new HeadroomContextEngine({ commitLogPath });
+    await expect(
+      after.commitTurn({ advancementKey: "turn-restart", messages: [] }),
+    ).resolves.toEqual({ status: "duplicate" });
+  });
+
+  it("never forgets a key regardless of how many other keys were committed since", async () => {
+    // Regression: the old implementation evicted the oldest key past a
+    // 512-entry cap, so a retry of an early key was wrongly re-accepted as
+    // new instead of reported as a duplicate. There is no such cap now.
+    const engine = new HeadroomContextEngine({ commitLogPath });
+
+    for (let i = 0; i < 600; i++) {
       await engine.commitTurn({ advancementKey: `turn-${i}`, messages: [] });
     }
 
-    expect((engine as { committedAdvancementKeys: Set<string> }).committedAdvancementKeys.size).toBe(
-      cap,
-    );
-    // The oldest key was evicted, so it is treated as new (committed) again rather than duplicate.
     await expect(
       engine.commitTurn({ advancementKey: "turn-0", messages: [] }),
-    ).resolves.toEqual({ status: "committed" });
+    ).resolves.toEqual({ status: "duplicate" });
   });
 });
