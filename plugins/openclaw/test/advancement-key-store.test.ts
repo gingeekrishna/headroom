@@ -23,6 +23,9 @@ const NODE_SUPPORTS_TRANSFORM_TYPES = (() => {
 })();
 
 const WORKER_PATH = fileURLToPath(new URL("./fixtures/commit-turn-worker.ts", import.meta.url));
+const HOLD_LOCK_WORKER_PATH = fileURLToPath(
+  new URL("./fixtures/hold-lock-worker.ts", import.meta.url),
+);
 
 /** Run the commit-turn worker as a real child process; returns its parsed JSON result. */
 async function runCommitWorker(
@@ -40,6 +43,17 @@ async function runCommitWorker(
     resultPath,
   ]);
   return JSON.parse(await fs.readFile(resultPath, "utf8"));
+}
+
+async function waitForFile(p: string): Promise<void> {
+  for (;;) {
+    try {
+      await fs.access(p);
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  }
 }
 
 describe("DurableAdvancementKeyStore", () => {
@@ -253,6 +267,55 @@ describe("DurableAdvancementKeyStore", () => {
       expect(statuses).toEqual(["committed", "duplicate"]);
     },
     30_000,
+  );
+
+  it.skipIf(!NODE_SUPPORTS_TRANSFORM_TYPES)(
+    "never lets a second writer commit while a live holder still holds the lock",
+    async () => {
+      // Regression for PR #3442 review, round 4: a lock reclaimed on an
+      // age-based staleness guess let a second process commit and release
+      // while the first (merely slow, not dead) holder still believed it
+      // owned the lock -- the first then resumed and overwrote the
+      // second's accepted commit with its own stale snapshot. This proves
+      // the invariant that replaces that heuristic: a second writer must
+      // never proceed while ANY holder -- however long it takes -- still
+      // holds the lock. Deterministic and fast: the "holder" is a worker
+      // that occupies the real lock file and only releases it when told
+      // to, rather than relying on a real multi-second sleep.
+      const readyPath = path.join(dir, "holder-ready");
+      const releasePath = path.join(dir, "holder-release");
+
+      const holder = execFileAsync(process.execPath, [
+        "--experimental-transform-types",
+        HOLD_LOCK_WORKER_PATH,
+        storePath,
+        readyPath,
+        releasePath,
+      ]);
+
+      // Wait until the holder has actually acquired the lock before racing
+      // a commit against it.
+      await waitForFile(readyPath);
+
+      const store = new DurableAdvancementKeyStore(storePath);
+      let secondCommitSettled = false;
+      const secondCommit = store.tryCommit("turn-b", ["b"]).finally(() => {
+        secondCommitSettled = true;
+      });
+
+      // Give the second commit ample opportunity to (wrongly) proceed
+      // while the holder is still alive and has not released.
+      await new Promise((r) => setTimeout(r, 500));
+      expect(secondCommitSettled).toBe(false);
+
+      // Release the holder; the second commit must now complete
+      // successfully, with nothing lost.
+      await fs.writeFile(releasePath, "go", "utf8");
+      await holder;
+      await expect(secondCommit).resolves.toBe("committed");
+      await expect(store.has("turn-b")).resolves.toBe(true);
+    },
+    15_000,
   );
 });
 

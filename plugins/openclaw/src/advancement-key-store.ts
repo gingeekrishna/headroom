@@ -17,9 +17,26 @@
  * real inter-process lock: an exclusive lock FILE (`<path>.lock`), acquired
  * via atomic exclusive creation (`open(..., "wx")`, which is atomic at the
  * OS level on POSIX and Windows alike) so only one process -- in this one or
- * any other -- can be inside the critical section at a time. A lock whose
- * holder crashed without releasing it is broken after `STALE_LOCK_MS` so a
- * dead process can't wedge every future commit to this file forever.
+ * any other -- can be inside the critical section at a time.
+ *
+ * The lock is never force-broken by age. An age-based "the holder must have
+ * crashed" heuristic cannot tell a dead holder apart from one that is simply
+ * slow (a large write, a GC pause, disk contention): a second process that
+ * reclaims a lock the first still holds can commit and release before the
+ * first resumes and overwrites that commit with its own now-stale snapshot
+ * -- both processes report "committed", but only the second process's write
+ * survives, and the first process's genuinely-accepted turn silently
+ * vanishes. Node has no built-in binding for a real OS-mediated lock
+ * (POSIX `flock`/Windows `LockFileEx`, where the kernel itself releases the
+ * lock when the holder's process exits, crash included, so no staleness
+ * guess is needed at all), so this fails closed instead: a lock that is
+ * never released is never reclaimed, and a caller that can't acquire it
+ * within the timeout gets a clear error rather than a silent lost write. A
+ * lock file orphaned by a genuinely crashed process requires a human (or an
+ * operator script) to remove `<path>.lock` before commits can resume --
+ * that operational cost is the trade for never silently dropping an
+ * acknowledged commit. Lock ownership is also verified before release (see
+ * `withFileLock`): a process only ever deletes the lock file it created.
  *
  * Every `tryCommit` re-reads the file fresh from disk inside the lock (no
  * long-lived in-memory cache), and the in-memory return value is only ever
@@ -71,8 +88,6 @@ export interface CommittedTurn {
 
 type CommitLog = Record<string, CommittedTurn>;
 
-/** A lock older than this is assumed to belong to a crashed holder and is broken. */
-const STALE_LOCK_MS = 30_000;
 /** Give up (rather than poll forever) if the lock still can't be acquired after this long. */
 const LOCK_ACQUIRE_TIMEOUT_MS = 60_000;
 const LOCK_POLL_BASE_MS = 20;
@@ -85,17 +100,27 @@ function sleep(ms: number): Promise<void> {
  * Run `fn` while holding an exclusive lock on `path` (a sibling `<path>.lock`
  * file). Serializes every caller -- this process or another -- against the
  * same file, not just calls on one object or one process.
+ *
+ * The lock is held until `fn` returns, however long that takes, and is
+ * never reclaimed by another caller on a staleness guess -- see the module
+ * docstring for why an age-based heuristic can silently drop a genuinely
+ * accepted commit. A caller that can't acquire the lock within
+ * `LOCK_ACQUIRE_TIMEOUT_MS` gets a clear timeout error instead of the
+ * transaction being allowed to proceed unsafely.
  */
 async function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const lockPath = `${path}.lock`;
   await mkdir(dirname(path), { recursive: true });
+  // Unique per acquisition, so release only ever removes the lock file this
+  // exact call created -- never one a different (later) holder created.
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
   let attempt = 0;
   for (;;) {
     try {
       const handle = await open(lockPath, "wx");
       try {
-        await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`);
+        await handle.writeFile(`${token}\n${process.pid}\n${new Date().toISOString()}\n`);
       } finally {
         await handle.close();
       }
@@ -104,24 +129,11 @@ async function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
       if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") {
         throw error;
       }
-      // Someone else holds the lock (this process or another). Break it if
-      // it looks abandoned -- a crashed holder must not wedge every future
-      // commit to this file forever -- then retry acquiring immediately.
-      try {
-        const lockStat = await stat(lockPath);
-        if (Date.now() - lockStat.mtimeMs > STALE_LOCK_MS) {
-          await unlink(lockPath).catch(() => undefined);
-          continue;
-        }
-      } catch (statError) {
-        if ((statError as NodeJS.ErrnoException)?.code !== "ENOENT") {
-          throw statError;
-        }
-        // Lock file vanished between our failed open and this stat -- retry.
-        continue;
-      }
       if (Date.now() > deadline) {
-        throw new Error(`Timed out waiting for the advancement-key-store lock on ${path}`);
+        throw new Error(
+          `Timed out waiting for the advancement-key-store lock on ${path}. If the ` +
+            `process that created ${lockPath} is no longer running, remove it manually.`,
+        );
       }
       attempt += 1;
       await sleep(LOCK_POLL_BASE_MS + Math.random() * LOCK_POLL_BASE_MS * Math.min(attempt, 10));
@@ -130,7 +142,19 @@ async function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   try {
     return await fn();
   } finally {
-    await unlink(lockPath).catch(() => undefined);
+    // Verify the lock file is still the one this call created before
+    // removing it -- if it doesn't start with our token, some other process
+    // (or a human) replaced or is using it, and it must not be touched.
+    try {
+      const current = await readFile(lockPath, "utf8");
+      if (current.startsWith(`${token}\n`)) {
+        await unlink(lockPath);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        throw error;
+      }
+    }
   }
 }
 
