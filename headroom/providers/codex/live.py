@@ -18,7 +18,11 @@ from headroom.providers.codex.endpoints import codex_backend_url, codex_backend_
 from headroom.providers.codex.headers import drop_header
 from headroom.providers.codex.runtime import resolve_codex_routing
 from headroom.proxy.handlers.openai import _is_allowed_websocket_origin
-from headroom.proxy.helpers import _strip_internal_headers, merge_extra_headers
+from headroom.proxy.helpers import (
+    _strip_internal_headers,
+    merge_extra_headers,
+    sanitize_forwarded_response_headers,
+)
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 
 logger = logging.getLogger("headroom.providers.codex.live")
@@ -80,10 +84,25 @@ async def handle_codex_live_http(
     openai_base_url: str,
     inbound_path: str,
 ) -> Response | None:
-    """Forward ChatGPT Codex Live call creation over HTTP."""
+    """Forward ChatGPT Codex Live call creation over HTTP.
+
+    Routing is resolved from headers alone, before the body is touched: a
+    non-ChatGPT-authenticated request must return `None` with the inbound
+    stream still unread, so the caller's generic passthrough fallback can
+    read it. Consuming `request.form()` first would leave that fallback
+    reading an already-drained stream (or, for a JSON body, wrongly reject
+    it here instead of falling through).
+    """
     upstream_headers = dict(request.headers.items())
     drop_header(upstream_headers, "host")
     drop_header(upstream_headers, "accept-encoding")
+    drop_header(upstream_headers, "content-length")
+    drop_header(upstream_headers, "content-type")
+    upstream_headers = _strip_internal_headers(upstream_headers)
+    decision = resolve_codex_routing(upstream_headers)
+    if not decision.is_chatgpt_auth:
+        return None
+
     form = await request.form()
     sdp = form.get("sdp")
     session = form.get("session")
@@ -94,11 +113,6 @@ async def handle_codex_live_http(
     except json.JSONDecodeError:
         return Response(content="Invalid session JSON.", status_code=400)
 
-    drop_header(upstream_headers, "content-length")
-    drop_header(upstream_headers, "content-type")
-    decision = resolve_codex_routing(upstream_headers)
-    if not decision.is_chatgpt_auth:
-        return None
     try:
         response = await http_client.request(
             "POST",
@@ -113,7 +127,11 @@ async def handle_codex_live_http(
     return Response(
         content=response.content,
         status_code=response.status_code,
-        headers=dict(response.headers),
+        # `response.content` is already decoded by httpx; replaying the
+        # upstream's content-encoding/content-length onto it makes the
+        # downstream client try to decompress plain bytes a second time.
+        # `Location` (and everything else) survives untouched.
+        headers=sanitize_forwarded_response_headers(response.headers),
     )
 
 
