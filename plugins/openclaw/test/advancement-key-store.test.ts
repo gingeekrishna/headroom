@@ -305,13 +305,15 @@ describe("DurableAdvancementKeyStore", () => {
 
       // Give the second commit ample opportunity to (wrongly) proceed
       // while the holder is still alive and has not released.
-      await new Promise((r) => setTimeout(r, 500));
-      expect(secondCommitSettled).toBe(false);
-
-      // Release the holder; the second commit must now complete
-      // successfully, with nothing lost.
-      await fs.writeFile(releasePath, "go", "utf8");
-      await holder;
+      try {
+        await new Promise((r) => setTimeout(r, 500));
+        expect(secondCommitSettled).toBe(false);
+      } finally {
+        // Release even if the assertion fails, so the child cannot leak.
+        await fs.writeFile(releasePath, "go", "utf8");
+        await holder;
+      }
+      // The second commit must now complete successfully, with nothing lost.
       await expect(secondCommit).resolves.toBe("committed");
       await expect(store.has("turn-b")).resolves.toBe(true);
     },

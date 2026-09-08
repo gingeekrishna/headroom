@@ -15,7 +15,7 @@
  *   <storePath> <readyPath> <releasePath>
  */
 
-import { access, mkdir, open, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, open, unlink, utimes, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 async function waitFor(p: string): Promise<void> {
@@ -39,6 +39,9 @@ async function main(): Promise<void> {
   await mkdir(dirname(storePath), { recursive: true });
   const handle = await open(lockPath, "wx");
   await handle.close();
+  // Exercise the former 30-second reclaim threshold without a slow test.
+  const oldTime = new Date(Date.now() - 60_000);
+  await utimes(lockPath, oldTime, oldTime);
 
   await writeFile(readyPath, "ready", "utf8");
 
