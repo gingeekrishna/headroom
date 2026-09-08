@@ -248,6 +248,74 @@ def test_anthropic_tool_result_user_message_does_not_start_a_new_turn():
 
 
 # ---------------------------------------------------------------------------
+# system/developer instruction preservation (PR #3059 review, round 2):
+# OpenAI keeps system/developer messages inline in the same `messages` array
+# a client sends, so without special handling a trim that reaches back far
+# enough silently drops the application's own instructions along with old
+# conversation turns.
+# ---------------------------------------------------------------------------
+
+
+def test_leading_system_and_developer_messages_survive_full_trim():
+    """The reviewer's exact repro: n=0 must drop the old turn but keep both
+    instruction messages, not just the trailing user message.
+    """
+    msgs = [
+        {"role": "system", "content": "Always answer in JSON"},
+        {"role": "developer", "content": "Use the required response schema"},
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "new question"},
+    ]
+
+    result, dropped = apply_keep_last_turns(msgs, n=0)
+
+    assert result == [
+        {"role": "system", "content": "Always answer in JSON"},
+        {"role": "developer", "content": "Use the required response schema"},
+        {"role": "user", "content": "new question"},
+    ]
+    # Only the two actually-removed conversational messages count as
+    # dropped -- the two retained instruction messages do not, even though
+    # the turn-boundary cutoff logically falls past them.
+    assert dropped == 2
+
+
+def test_system_and_developer_messages_keep_their_original_relative_order():
+    """Instruction messages are preserved in place, not hoisted to the front."""
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q0"},
+        {"role": "assistant", "content": "a0"},
+        {"role": "developer", "content": "dev"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "final"},
+    ]
+
+    result, dropped = apply_keep_last_turns(msgs, n=0)
+
+    assert result == [
+        {"role": "system", "content": "sys"},
+        {"role": "developer", "content": "dev"},
+        {"role": "user", "content": "final"},
+    ]
+    assert dropped == 4
+
+
+def test_no_instruction_messages_behaves_exactly_as_before():
+    """Backward compatibility: with no system/developer messages present,
+    behavior is identical to the plain turn-boundary trim.
+    """
+    msgs = _turns(3)
+
+    result, dropped = apply_keep_last_turns(msgs, n=1)
+
+    assert len(result) == 3
+    assert dropped == 4
+
+
+# ---------------------------------------------------------------------------
 # Handler-level regression coverage (PR #3059 review): exercise the real
 # /v1/chat/completions and /v1/messages handlers so this proves the message
 # list actually forwarded upstream is coherent, not just the helper in
@@ -311,6 +379,95 @@ def test_handler_openai_keep_last_turns_preserves_tool_call_pairing():
         sent = captured["messages"]
         # n=1 with exactly one prior (tool-calling) turn: nothing dropped.
         assert sent == messages
+        tool_call_ids = {
+            tc["id"]
+            for msg in sent
+            if msg.get("role") == "assistant"
+            for tc in (msg.get("tool_calls") or [])
+        }
+        tool_message_ids = {msg["tool_call_id"] for msg in sent if msg.get("role") == "tool"}
+        assert tool_message_ids <= tool_call_ids, (
+            "a tool result was orphaned from its tool_calls entry"
+        )
+
+
+def test_handler_openai_keep_last_turns_preserves_instructions_and_retained_tool_turn():
+    """Regression for PR #3059 review, round 2: system/developer instructions
+    must survive a trim that drops an older turn, and a tool-using turn that
+    IS retained must still forward intact (no orphaned tool result) --
+    exercised through the real handler, not the helper in isolation.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    with TestClient(create_app(config)) as client:
+        proxy = client.app.state.proxy
+        captured: dict[str, object] = {}
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            captured["messages"] = body["messages"]
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_1",
+                    "object": "chat.completion",
+                    "model": "gpt-4o",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        system_msg = {"role": "system", "content": "Always answer in JSON"}
+        developer_msg = {"role": "developer", "content": "Use the required response schema"}
+        old_turn = [
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        retained_tool_turn = _openai_tool_turn("q0", "call_1", "result0", "a0")
+        messages = [
+            system_msg,
+            developer_msg,
+            *old_turn,
+            *retained_tool_turn,
+            {"role": "user", "content": "final question"},
+        ]
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-headroom-keep-last-turns": "1"},
+            json={"model": "gpt-4o", "messages": messages},
+        )
+
+        assert response.status_code == 200, response.text
+        sent = captured["messages"]
+
+        # Both instructions survive, in their original relative position.
+        assert sent[0] == system_msg
+        assert sent[1] == developer_msg
+        # The old plain turn is gone; the retained tool-using turn and the
+        # trailing user message follow immediately after the instructions.
+        assert sent[2:] == [*retained_tool_turn, {"role": "user", "content": "final question"}]
+
         tool_call_ids = {
             tc["id"]
             for msg in sent
