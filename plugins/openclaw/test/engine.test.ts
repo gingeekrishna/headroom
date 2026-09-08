@@ -322,18 +322,35 @@ describe("HeadroomContextEngine transcriptSemantics contract", () => {
     ).resolves.toEqual({ status: "duplicate" });
   });
 
-  it("never forgets a key regardless of how many other keys were committed since", async () => {
-    // Regression: the old implementation evicted the oldest key past a
-    // 512-entry cap, so a retry of an early key was wrongly re-accepted as
-    // new instead of reported as a duplicate. There is no such cap now.
-    const engine = new HeadroomContextEngine({ commitLogPath });
+  it(
+    "never forgets a key regardless of how many other keys were committed since",
+    async () => {
+      // Regression: the old implementation evicted the oldest key past a
+      // 512-entry cap, so a retry of an early key was wrongly re-accepted as
+      // new instead of reported as a duplicate. There is no such cap now.
+      const engine = new HeadroomContextEngine({ commitLogPath });
 
-    for (let i = 0; i < 600; i++) {
-      await engine.commitTurn({ advancementKey: `turn-${i}`, messages: [] });
-    }
+      for (let i = 0; i < 600; i++) {
+        await engine.commitTurn({ advancementKey: `turn-${i}`, messages: [] });
+      }
+
+      await expect(
+        engine.commitTurn({ advancementKey: "turn-0", messages: [] }),
+      ).resolves.toEqual({ status: "duplicate" });
+    },
+    20_000,
+  );
+
+  it("persists the accepted messages together with the advancement key", async () => {
+    const engine = new HeadroomContextEngine({ commitLogPath });
+    const messages = [{ role: "user", content: "hello" }];
 
     await expect(
-      engine.commitTurn({ advancementKey: "turn-0", messages: [] }),
-    ).resolves.toEqual({ status: "duplicate" });
+      engine.commitTurn({ advancementKey: "turn-1", messages }),
+    ).resolves.toEqual({ status: "committed" });
+
+    const raw = await fs.readFile(commitLogPath, "utf8");
+    const entries = JSON.parse(raw) as Record<string, { messages: unknown }>;
+    expect(entries["turn-1"].messages).toEqual(messages);
   });
 });

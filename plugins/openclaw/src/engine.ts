@@ -238,16 +238,17 @@ export class HeadroomContextEngine {
   /**
    * Durable turn-advancement commit — required by OpenClaw's transcriptSemantics
    * contract. Called only for the accepted, successful turn; failed or aborted
-   * turns never reach here. Must be an atomic, idempotent write keyed by
-   * `advancementKey` so a host retry with the same key reports "duplicate"
-   * instead of re-applying the advancement — including a retry that arrives
-   * after this process restarted, which is why the record lives on disk
-   * (see `DurableAdvancementKeyStore`) rather than in an in-memory Set.
+   * turns never reach here. Must be an atomic, idempotent write of the
+   * accepted `messages` keyed by `advancementKey` so a host retry with the
+   * same key reports "duplicate" instead of re-applying the advancement —
+   * including a retry that arrives after this process restarted, which is
+   * why the record lives on disk (see `DurableAdvancementKeyStore`) rather
+   * than in memory, and includes the messages rather than just the key.
    */
   async commitTurn(params: { advancementKey: string; messages: any[] }): Promise<{
     status: "committed" | "duplicate";
   }> {
-    const status = await this.advancementKeyStore.tryCommit(params.advancementKey);
+    const status = await this.advancementKeyStore.tryCommit(params.advancementKey, params.messages);
     return { status };
   }
 
