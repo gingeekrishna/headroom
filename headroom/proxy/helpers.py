@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from headroom import paths as _paths
+from headroom.cache.compression_cache import _is_tool_result_message
 from headroom.proxy import (
     diagnostic_decode_policy,
     memory_injection_mode_policy,
@@ -3301,8 +3302,21 @@ def apply_keep_last_turns(
 ) -> tuple[list[dict[str, Any]], int]:
     """Trim ``messages`` to the last *n* conversation turns.
 
-    A "turn" is one user+assistant pair.  The trailing user message is
-    always kept regardless of *n* (it is the current request).
+    A "turn" starts at a genuine user message and runs up to (but not
+    including) the next one — so a tool-calling round trip stays part of
+    the turn that triggered it, however many messages it spans:
+    ``user -> assistant(tool_calls) -> tool -> tool -> assistant`` is one
+    turn, not the two-message ``user, assistant`` pair a fixed-size slice
+    would assume. A message only starts a *new* turn when its role is
+    ``"user"`` AND it is not itself a tool-result continuation of the
+    previous turn — Anthropic represents tool results as ``role="user"``
+    messages (``content`` blocks of type ``tool_result``), so a bare
+    role check would misfire on ordinary Anthropic tool use and orphan the
+    tool_use/tool_result pairing exactly like the arithmetic slice did.
+
+    The trailing turn (the last turn-start through the end of the list) is
+    always kept in full regardless of *n* — it is the current, not-yet-
+    answered request. *n* counts complete turns before that one.
 
     Returns ``(trimmed_messages, n_dropped)`` — the caller can log
     *n_dropped* and append ``keep_last_turns:{n}:{n_dropped}_dropped``
@@ -3312,11 +3326,24 @@ def apply_keep_last_turns(
 
     Invariants:
     - n < 0 is treated as no-op (invalid, never trim).
-    - The result always contains at least one message (the final user msg).
+    - A dropped prefix always ends exactly on a turn boundary: every
+      message belonging to a retained turn (including its tool_calls/
+      tool_result messages) is kept, and every message belonging to a
+      dropped turn is dropped — never a partial turn.
     """
     if n < 0 or not messages:
         return messages, 0
-    tail = max(0, len(messages) - 1 - n * 2)
+    turn_starts = [
+        i
+        for i, msg in enumerate(messages)
+        if msg.get("role") == "user" and not _is_tool_result_message(msg)
+    ]
+    if not turn_starts:
+        return messages, 0
+    prior_turns = len(turn_starts) - 1
+    if n >= prior_turns:
+        return messages, 0
+    tail = turn_starts[prior_turns - n]
     if tail == 0:
         return messages, 0
     return messages[tail:], tail
