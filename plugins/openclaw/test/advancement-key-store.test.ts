@@ -1,10 +1,46 @@
+import { execFile } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { DurableAdvancementKeyStore, defaultCommitLogPath } from "../src/advancement-key-store.js";
+
+const execFileAsync = promisify(execFile);
+
+// Node's native TypeScript support (needed to run the worker fixture, which
+// imports the real DurableAdvancementKeyStore, as a plain `node` child
+// process with no build step) requires `--experimental-transform-types`,
+// added in Node 22.6. Skip the cross-process tests rather than fail on an
+// older Node -- the failure mode being tested (a lost write across two OS
+// processes) is orthogonal to which Node version happens to run the test.
+const NODE_SUPPORTS_TRANSFORM_TYPES = (() => {
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  return major > 22 || (major === 22 && minor >= 6);
+})();
+
+const WORKER_PATH = fileURLToPath(new URL("./fixtures/commit-turn-worker.ts", import.meta.url));
+
+/** Run the commit-turn worker as a real child process; returns its parsed JSON result. */
+async function runCommitWorker(
+  storePath: string,
+  key: string,
+  goPath: string,
+  resultPath: string,
+): Promise<{ status?: string; error?: string }> {
+  await execFileAsync(process.execPath, [
+    "--experimental-transform-types",
+    WORKER_PATH,
+    storePath,
+    key,
+    goPath,
+    resultPath,
+  ]);
+  return JSON.parse(await fs.readFile(resultPath, "utf8"));
+}
 
 describe("DurableAdvancementKeyStore", () => {
   let dir: string;
@@ -157,6 +193,67 @@ describe("DurableAdvancementKeyStore", () => {
     await expect(after.tryCommit("turn-a", [])).resolves.toBe("duplicate");
     await expect(after.tryCommit("turn-b", [])).resolves.toBe("duplicate");
   });
+
+  // -------------------------------------------------------------------
+  // PR #3442 review, round 3: an in-process lock (a JS Map/promise queue)
+  // does nothing to stop two separate OS processes -- e.g. two gateway
+  // processes sharing one Headroom workspace -- from racing the same
+  // commit-log file. These spawn the real DurableAdvancementKeyStore in
+  // real child processes (not Worker threads, which share the parent's
+  // memory and wouldn't exercise inter-process file locking) and release
+  // them via a shared "go" file so their read/check/write transactions
+  // contend for the file lock as close to simultaneously as possible.
+  // -------------------------------------------------------------------
+
+  it.skipIf(!NODE_SUPPORTS_TRANSFORM_TYPES)(
+    "serializes commits from two separate OS processes sharing the same file",
+    async () => {
+      const goPath = path.join(dir, "go");
+      const resultAPath = path.join(dir, "result-a.json");
+      const resultBPath = path.join(dir, "result-b.json");
+
+      const workerA = runCommitWorker(storePath, "turn-a", goPath, resultAPath);
+      const workerB = runCommitWorker(storePath, "turn-b", goPath, resultBPath);
+      // Give both worker processes time to spawn and reach their poll loop
+      // before releasing them together.
+      await new Promise((r) => setTimeout(r, 300));
+      await fs.writeFile(goPath, "go", "utf8");
+
+      const [resultA, resultB] = await Promise.all([workerA, workerB]);
+
+      expect(resultA).toEqual({ status: "committed" });
+      expect(resultB).toEqual({ status: "committed" });
+
+      // Neither commit was lost to a cross-process race.
+      const after = new DurableAdvancementKeyStore(storePath);
+      await expect(after.has("turn-a")).resolves.toBe(true);
+      await expect(after.has("turn-b")).resolves.toBe(true);
+    },
+    30_000,
+  );
+
+  it.skipIf(!NODE_SUPPORTS_TRANSFORM_TYPES)(
+    "reports duplicate for the same key committed from two separate OS processes",
+    async () => {
+      const goPath = path.join(dir, "go");
+      const resultAPath = path.join(dir, "result-a.json");
+      const resultBPath = path.join(dir, "result-b.json");
+
+      const workerA = runCommitWorker(storePath, "turn-same", goPath, resultAPath);
+      const workerB = runCommitWorker(storePath, "turn-same", goPath, resultBPath);
+      await new Promise((r) => setTimeout(r, 300));
+      await fs.writeFile(goPath, "go", "utf8");
+
+      const [resultA, resultB] = await Promise.all([workerA, workerB]);
+
+      // Exactly one process's transaction should win the race and see
+      // "committed"; the other must see "duplicate", never both
+      // "committed" (which would mean the file lock let them interleave).
+      const statuses = [resultA.status, resultB.status].sort();
+      expect(statuses).toEqual(["committed", "duplicate"]);
+    },
+    30_000,
+  );
 });
 
 describe("defaultCommitLogPath", () => {
