@@ -112,9 +112,9 @@ describe("DurableAdvancementKeyStore", () => {
     expect(reloaded?.messages).toEqual(messages);
   });
 
-  it("does not remember a key when the write fails, so a retry can still succeed", async () => {
-    // Block the parent directory by putting a FILE where a directory needs
-    // to be created, so `mkdir(dirname, {recursive:true})` fails.
+  it("does not remember a key when storage is inaccessible, so a retry can still succeed", async () => {
+    // Block the parent directory with a file. Both the commit's initial
+    // read and a membership lookup must propagate the filesystem error.
     const blockedParent = path.join(dir, "blocked");
     await fs.writeFile(blockedParent, "not a directory", "utf8");
     const blockedPath = path.join(blockedParent, "commit-log.json");
@@ -126,10 +126,12 @@ describe("DurableAdvancementKeyStore", () => {
     // reason) rather than silently reporting "duplicate" for a commit that
     // never reached disk.
     await expect(store.tryCommit("turn-1", [])).rejects.toThrow();
-    await expect(store.has("turn-1")).resolves.toBe(false);
+    await expect(store.has("turn-1")).rejects.toThrow();
 
-    // Once the underlying problem is fixed, the same key commits normally.
+    // Once the underlying problem is fixed, the key is still absent and
+    // the same key commits normally.
     await fs.rm(blockedParent, { force: true });
+    await expect(store.has("turn-1")).resolves.toBe(false);
     await expect(store.tryCommit("turn-1", [])).resolves.toBe("committed");
     await expect(store.has("turn-1")).resolves.toBe(true);
   });
