@@ -536,6 +536,89 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
     ]
 
 
+def _restart_race_manifest():
+    class Manifest:
+        profile = "default"
+        preset = "persistent-service"
+        runtime_kind = "python"
+        supervisor_kind = "service"
+        scope = "user"
+        health_url = "http://127.0.0.1:8787/readyz"
+        mutations: list = []
+
+    return Manifest()
+
+
+def test_install_restart_waits_for_old_process_before_starting(monkeypatch) -> None:
+    """#3658: the old proxy still answers /readyz right after stop; restart must
+    wait for it to go away, otherwise start is skipped and the service stays down."""
+
+    runner = CliRunner()
+    calls: list[str] = []
+    stopped = {"value": False}
+    answers = iter([True, True, False])  # still up for two probes after stop
+
+    def probe(url):
+        if not stopped["value"]:
+            return False
+        try:
+            return next(answers)
+        except StopIteration:
+            return calls.count("start_supervisor") > 0
+
+    monkeypatch.setattr(
+        "headroom.cli.install.load_manifest", lambda profile: _restart_race_manifest()
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.stop_supervisor",
+        lambda manifest: stopped.update(value=True) or calls.append("stop_supervisor"),
+    )
+    monkeypatch.setattr("headroom.cli.install.stop_runtime", lambda manifest: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_ready", lambda manifest, timeout_seconds=45: True
+    )
+    monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda manifest: [])
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda manifest: None)
+    monkeypatch.setattr("headroom.cli.install.probe_ready", probe)
+    monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
+    monkeypatch.setattr("headroom.cli.install.time.sleep", lambda seconds: None)
+
+    result = runner.invoke(main, ["install", "restart"])
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["stop_supervisor", "start_supervisor"]
+
+
+def test_install_restart_fails_when_old_process_never_stops(monkeypatch) -> None:
+    runner = CliRunner()
+    calls: list[str] = []
+    clock = {"now": 0.0}
+
+    monkeypatch.setattr(
+        "headroom.cli.install.load_manifest", lambda profile: _restart_race_manifest()
+    )
+    monkeypatch.setattr("headroom.cli.install.stop_supervisor", lambda manifest: None)
+    monkeypatch.setattr("headroom.cli.install.stop_runtime", lambda manifest: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
+    )
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
+    monkeypatch.setattr("headroom.cli.install.save_manifest", lambda manifest: None)
+    monkeypatch.setattr("headroom.cli.install.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        "headroom.cli.install.time.sleep", lambda seconds: clock.update(now=clock["now"] + 5)
+    )
+
+    result = runner.invoke(main, ["install", "restart"])
+
+    assert result.exit_code != 0
+    assert "Restarted deployment" not in result.output
+    assert calls == []
+
+
 def test_install_start_noops_when_already_healthy(monkeypatch) -> None:
     runner = CliRunner()
     calls: list[str] = []
