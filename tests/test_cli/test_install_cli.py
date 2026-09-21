@@ -519,6 +519,7 @@ def test_install_restart_uses_internal_helpers(monkeypatch) -> None:
     )
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda manifest: calls.append("save"))
     monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
+    monkeypatch.setattr("headroom.cli.install.wait_stopped", lambda manifest: True)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
 
     result = runner.invoke(main, ["install", "restart"])
@@ -555,25 +556,20 @@ def test_install_restart_waits_for_old_process_before_starting(monkeypatch) -> N
 
     runner = CliRunner()
     calls: list[str] = []
-    stopped = {"value": False}
-    answers = iter([True, True, False])  # still up for two probes after stop
-
-    def probe(url):
-        if not stopped["value"]:
-            return False
-        try:
-            return next(answers)
-        except StopIteration:
-            return calls.count("start_supervisor") > 0
 
     monkeypatch.setattr(
         "headroom.cli.install.load_manifest", lambda profile: _restart_race_manifest()
     )
     monkeypatch.setattr(
-        "headroom.cli.install.stop_supervisor",
-        lambda manifest: stopped.update(value=True) or calls.append("stop_supervisor"),
+        "headroom.cli.install.stop_supervisor", lambda manifest: calls.append("stop_supervisor")
     )
-    monkeypatch.setattr("headroom.cli.install.stop_runtime", lambda manifest: None)
+    monkeypatch.setattr(
+        "headroom.cli.install.stop_runtime", lambda manifest: calls.append("stop_runtime")
+    )
+    monkeypatch.setattr(
+        "headroom.cli.install.wait_stopped",
+        lambda manifest, timeout_seconds=15: calls.append("wait_stopped") or True,
+    )
     monkeypatch.setattr(
         "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
     )
@@ -582,20 +578,19 @@ def test_install_restart_waits_for_old_process_before_starting(monkeypatch) -> N
     )
     monkeypatch.setattr("headroom.cli.install.apply_mutations", lambda manifest: [])
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda manifest: None)
-    monkeypatch.setattr("headroom.cli.install.probe_ready", probe)
+    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: False)
     monkeypatch.setattr("headroom.cli.install.runtime_status", lambda manifest: "stopped")
-    monkeypatch.setattr("headroom.cli.install.time.sleep", lambda seconds: None)
 
     result = runner.invoke(main, ["install", "restart"])
 
     assert result.exit_code == 0, result.output
-    assert calls == ["stop_supervisor", "start_supervisor"]
+    assert calls == ["stop_supervisor", "stop_runtime", "wait_stopped", "start_supervisor"]
 
 
-def test_install_restart_fails_when_old_process_never_stops(monkeypatch) -> None:
+@pytest.mark.parametrize("command", ["stop", "restart"])
+def test_install_stop_and_restart_fail_when_old_process_never_stops(monkeypatch, command) -> None:
     runner = CliRunner()
     calls: list[str] = []
-    clock = {"now": 0.0}
 
     monkeypatch.setattr(
         "headroom.cli.install.load_manifest", lambda profile: _restart_race_manifest()
@@ -603,19 +598,18 @@ def test_install_restart_fails_when_old_process_never_stops(monkeypatch) -> None
     monkeypatch.setattr("headroom.cli.install.stop_supervisor", lambda manifest: None)
     monkeypatch.setattr("headroom.cli.install.stop_runtime", lambda manifest: None)
     monkeypatch.setattr(
+        "headroom.cli.install.wait_stopped", lambda manifest, timeout_seconds=15: False
+    )
+    monkeypatch.setattr(
         "headroom.cli.install.start_supervisor", lambda manifest: calls.append("start_supervisor")
     )
-    monkeypatch.setattr("headroom.cli.install.probe_ready", lambda url: True)
     monkeypatch.setattr("headroom.cli.install.save_manifest", lambda manifest: None)
-    monkeypatch.setattr("headroom.cli.install.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr(
-        "headroom.cli.install.time.sleep", lambda seconds: clock.update(now=clock["now"] + 5)
-    )
 
-    result = runner.invoke(main, ["install", "restart"])
+    result = runner.invoke(main, ["install", command])
 
     assert result.exit_code != 0
-    assert "Restarted deployment" not in result.output
+    assert "still answering" in result.output
+    assert "deployment 'default'." not in result.output
     assert calls == []
 
 

@@ -6,7 +6,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -34,6 +33,7 @@ from headroom.install.runtime import (
     start_persistent_docker,
     stop_runtime,
     wait_ready,
+    wait_stopped,
 )
 from headroom.install.state import (
     ManifestError,
@@ -192,26 +192,15 @@ def _stop_deployment(manifest: DeploymentManifest) -> None:
     if manifest.supervisor_kind == SupervisorKind.SERVICE.value:
         stop_supervisor(manifest)
     stop_runtime(manifest)
-
-
-def _wait_until_stopped(manifest: DeploymentManifest, timeout_seconds: int = 15) -> None:
-    """Block until the deployment's health endpoint stops answering.
-
-    Stopping the supervisor/runtime returns before the old process has finished
-    its graceful shutdown, so it can keep answering ``/readyz`` for a moment.
-    ``_start_deployment`` treats a ready endpoint as "already running" and
-    returns without starting anything, which leaves the deployment stopped once
-    the old process exits.
-    """
-
-    deadline = time.monotonic() + timeout_seconds
-    while probe_ready(manifest.health_url):
-        if time.monotonic() >= deadline:
-            raise click.ClickException(
-                f"Deployment '{manifest.profile}' is still answering on "
-                f"{manifest.health_url} after stop; refusing to report a restart."
-            )
-        time.sleep(0.25)
+    # Stopping returns before the old process has finished shutting down, so it
+    # can keep answering /readyz. `_start_deployment` treats a ready endpoint as
+    # "already running" and would skip the start, leaving the deployment stopped
+    # once the old process exits. Block until it is really gone.
+    if not wait_stopped(manifest):
+        raise click.ClickException(
+            f"Deployment '{manifest.profile}' is still answering on "
+            f"{manifest.health_url} after stop."
+        )
 
 
 def _deactivate_deployment_mutations(
@@ -889,7 +878,6 @@ def install_restart(profile: str) -> None:
     _reject_task_lifecycle(manifest, "restart")
     _deactivate_deployment_mutations(manifest)
     _stop_deployment(manifest)
-    _wait_until_stopped(manifest)
     _start_deployment(manifest)
     _activate_deployment_mutations(manifest)
     click.echo(f"Restarted deployment '{profile}'.")
