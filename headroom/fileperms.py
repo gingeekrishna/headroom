@@ -50,11 +50,19 @@ Scope of the guarantee — read this before citing it in a threat model:
   (:func:`ensure_private_file`/:func:`connect_private_sqlite`) or
   :func:`private_dir` — those remain unenforced on Windows, same as before.
 
-``O_NOFOLLOW`` does not exist on Windows either. :func:`restrict_path_to_owner`
-itself still refuses a symlinked path the same way on both platforms; the
-Windows ACL path adds ``FILE_FLAG_OPEN_REPARSE_POINT`` underneath that so the
-link itself is what gets opened if anything slips past the first check, not
-its target.
+``O_NOFOLLOW`` does not exist on Windows, so the CRT ``os.open`` underneath
+Python's own ``open()`` has no way to refuse a symlink/junction there — it
+silently follows one to whatever it points at. :func:`open_owner_only` does
+not route through that on Windows for this reason: it opens via
+``headroom._fileperms_windows.open_no_follow``, which uses
+``FILE_FLAG_OPEN_REPARSE_POINT`` to open the reparse point itself regardless
+of create-or-open disposition, and refuses it outright if the resulting
+handle's own attributes show it is one — closing the same gap ``O_NOFOLLOW``
+closes on POSIX, checked on the handle rather than the path so there is
+nothing for a race to redirect. :func:`restrict_path_to_owner` uses the same
+flag for the same reason when narrowing a file it did not open itself
+(rotated backups): because that path only ever touches the reparse point's
+own DACL, never a target's, it is safe even without the attribute check.
 """
 
 from __future__ import annotations
@@ -169,22 +177,43 @@ def open_owner_only(
 
     Raises ``OSError`` — which every caller already treats as "logging is
     unavailable, carry on" — if the path cannot be opened, including when it is
-    a symlink on a platform with ``O_NOFOLLOW``. Failing closed is deliberate:
-    a redirected sensitive log is worse than no log.
+    a symlink or junction. Failing closed is deliberate: a redirected sensitive
+    log is worse than no log.
+
+    On POSIX, ``O_NOFOLLOW`` makes the ``os.open`` below refuse a symlink at
+    the kernel level. Windows has no such flag -- plain ``os.open`` there
+    silently follows a planted symlink/junction to whatever it points at, so
+    a DACL applied afterward lands on the target, not the intended file; this
+    goes through :func:`headroom._fileperms_windows.open_no_follow` instead,
+    which opens the reparse point itself and verifies that before touching
+    anything, closing the one path/open gap ``O_NOFOLLOW`` closes on POSIX.
     """
     if mode[:1] not in ("a", "w"):
         raise ValueError(f"open_owner_only: mode must start with 'a' or 'w', got {mode!r}")
-    fd = os.open(path, _open_flags(truncate=mode.startswith("w")), OWNER_ONLY_MODE)
-    try:
-        restrict_fd_to_owner(fd)
-        return open(fd, mode, encoding=encoding, errors=errors, newline=newline, closefd=True)
-    except BaseException:
+    truncate = mode.startswith("w")
+    if OWNER_ONLY_SUPPORTED:
+        fd = os.open(path, _open_flags(truncate=truncate), OWNER_ONLY_MODE)
         try:
-            os.close(fd)
-        except OSError:
-            # open() can have taken and closed the descriptor on its way out.
-            pass
-        raise
+            restrict_fd_to_owner(fd)
+            return open(fd, mode, encoding=encoding, errors=errors, newline=newline, closefd=True)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                # open() can have taken and closed the descriptor on its way out.
+                pass
+            raise
+    if _win is not None:
+        fd = _win.open_no_follow(os.fspath(path), truncate=truncate)
+        try:
+            return open(fd, mode, encoding=encoding, errors=errors, newline=newline, closefd=True)
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+    return open(path, mode, encoding=encoding, errors=errors, newline=newline)
 
 
 def ensure_private_file(path: str | os.PathLike[str], *, what: str = "file") -> None:

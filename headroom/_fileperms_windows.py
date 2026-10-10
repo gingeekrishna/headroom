@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ctypes
 import msvcrt
+import os
 from ctypes import wintypes
 
 _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
@@ -48,6 +49,12 @@ _TokenUser = 1
 _WRITE_DAC = 0x00040000
 _READ_CONTROL = 0x00020000
 _OPEN_EXISTING = 3
+_CREATE_NEW = 1
+_GENERIC_WRITE = 0x40000000
+_ERROR_FILE_NOT_FOUND = 2
+_FILE_BEGIN = 0
+_FILE_ATTRIBUTE_NORMAL = 0x80
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _FILE_SHARE_READ = 1
 _FILE_SHARE_WRITE = 2
 _FILE_SHARE_DELETE = 4
@@ -156,6 +163,37 @@ _kernel32.CreateFileW.argtypes = [
     wintypes.HANDLE,
 ]
 _kernel32.CreateFileW.restype = wintypes.HANDLE
+_kernel32.SetFilePointerEx.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_longlong,
+    ctypes.POINTER(ctypes.c_longlong),
+    wintypes.DWORD,
+]
+_kernel32.SetFilePointerEx.restype = wintypes.BOOL
+_kernel32.SetEndOfFile.argtypes = [wintypes.HANDLE]
+_kernel32.SetEndOfFile.restype = wintypes.BOOL
+
+
+class _ByHandleFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", wintypes.DWORD),
+        ("ftCreationTime", wintypes.FILETIME),
+        ("ftLastAccessTime", wintypes.FILETIME),
+        ("ftLastWriteTime", wintypes.FILETIME),
+        ("dwVolumeSerialNumber", wintypes.DWORD),
+        ("nFileSizeHigh", wintypes.DWORD),
+        ("nFileSizeLow", wintypes.DWORD),
+        ("nNumberOfLinks", wintypes.DWORD),
+        ("nFileIndexHigh", wintypes.DWORD),
+        ("nFileIndexLow", wintypes.DWORD),
+    ]
+
+
+_kernel32.GetFileInformationByHandle.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(_ByHandleFileInformation),
+]
+_kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
 
 
 class _AclSizeInformation(ctypes.Structure):
@@ -293,6 +331,80 @@ def restrict_path(path: str) -> bool:
         return _apply_owner_only_dacl(handle)
     finally:
         _kernel32.CloseHandle(handle)
+
+
+def open_no_follow(path: str, *, truncate: bool) -> int:
+    """Create-or-open *path* for append/truncate, refusing a symlink or
+    junction there, and apply the owner-only DACL -- all against the one
+    HANDLE this opens, so there is no window between checking the path and
+    writing through it.
+
+    This is the primitive :func:`headroom.fileperms.open_owner_only` needs
+    and plain ``os.open()`` cannot provide on Windows: the CRT open it wraps
+    has no ``O_NOFOLLOW`` equivalent, so it silently follows a planted
+    symlink/junction to whatever it points at, and anything opened that way
+    -- including a later DACL change -- lands on the target, not the
+    intended file. ``FILE_FLAG_OPEN_REPARSE_POINT`` makes this CreateFileW
+    call open the reparse point itself rather than its target regardless of
+    *disposition*, so the attribute check below sees the real thing even on
+    the create-or-open path a planted link races against.
+
+    Raises ``OSError`` on any failure, including when *path* is a symlink or
+    junction -- matching the POSIX ``O_NOFOLLOW`` contract this mirrors, and
+    the caller's existing "failing closed is deliberate" policy.
+
+    Always opens with ``OPEN_EXISTING`` first, regardless of *truncate*.
+    ``CREATE_ALWAYS``/``OPEN_ALWAYS`` against an existing reparse point does
+    not error or open the link -- it deletes it and creates a fresh regular
+    file in its place, *before* this function ever gets a handle to inspect,
+    so the refusal below would silently never fire for exactly the request
+    (truncate) that most needs it. Truncating, when asked for, happens via
+    ``SetEndOfFile`` on the one handle this function opens, once that handle
+    is confirmed not to be a reparse point -- never by asking ``CreateFileW``
+    to recreate the path.
+    """
+    access = _GENERIC_WRITE | _WRITE_DAC
+    share = _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE
+    flags = _FILE_FLAG_OPEN_REPARSE_POINT | _FILE_ATTRIBUTE_NORMAL
+
+    handle = _kernel32.CreateFileW(path, access, share, None, _OPEN_EXISTING, flags, None)
+    if not handle or handle == _INVALID_HANDLE_VALUE:
+        err = ctypes.get_last_error()  # type: ignore[attr-defined]
+        if err != _ERROR_FILE_NOT_FOUND:
+            raise OSError(f"CreateFileW failed for {path!r}: error {err}")
+        # Nothing there yet. CREATE_NEW fails outright instead of silently
+        # opening whatever a symlink planted in the gap since the check
+        # above left behind -- the same race OPEN_EXISTING already closed
+        # for the file-exists case, closed here for the file-missing one.
+        handle = _kernel32.CreateFileW(path, access, share, None, _CREATE_NEW, flags, None)
+        if not handle or handle == _INVALID_HANDLE_VALUE:
+            err = ctypes.get_last_error()  # type: ignore[attr-defined]
+            raise OSError(f"CreateFileW failed for {path!r}: error {err}")
+    try:
+        info = _ByHandleFileInformation()
+        if not _kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+            err = ctypes.get_last_error()  # type: ignore[attr-defined]
+            raise OSError(f"GetFileInformationByHandle failed for {path!r}: error {err}")
+        if info.dwFileAttributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError(f"refusing to open {path!r}: it is a symlink or junction")
+        if truncate:
+            if not _kernel32.SetFilePointerEx(handle, 0, None, _FILE_BEGIN):
+                err = ctypes.get_last_error()  # type: ignore[attr-defined]
+                raise OSError(f"SetFilePointerEx failed for {path!r}: error {err}")
+            if not _kernel32.SetEndOfFile(handle):
+                err = ctypes.get_last_error()  # type: ignore[attr-defined]
+                raise OSError(f"SetEndOfFile failed for {path!r}: error {err}")
+        # Best-effort, like every other restrict_* call: a failure here does
+        # not fail the open (see fileperms.verify_owner_only for why), but a
+        # planted symlink always fails above regardless of this result.
+        _apply_owner_only_dacl(handle)
+        fd: int = msvcrt.open_osfhandle(  # type: ignore[attr-defined]
+            handle, os.O_APPEND if not truncate else os.O_TRUNC
+        )
+        return fd
+    except BaseException:
+        _kernel32.CloseHandle(handle)
+        raise
 
 
 def verify_handle(fd: int) -> bool:

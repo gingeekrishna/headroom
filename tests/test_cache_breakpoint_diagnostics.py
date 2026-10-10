@@ -463,6 +463,82 @@ def test_open_owner_only_fails_closed_on_a_symlink(tmp_path) -> None:
         fileperms.open_owner_only(link).close()
 
 
+def _try_symlink(link: Path, target: Path) -> None:
+    """Create a real symlink, or skip with an explicit reason.
+
+    Unprivileged symlink creation on Windows needs Developer Mode; a CI
+    runner without it would otherwise either silently skip this test's
+    actual point or crash on the OSError from symlink_to itself. Skipping
+    explicitly, with the reason, is the point: a runner that cannot create
+    symlinks must say so rather than have this look covered by the ACL
+    assertions elsewhere in this file, which exercise a different thing.
+    """
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(
+            f"cannot create a symlink on this runner ({exc}); needs Developer Mode on Windows"
+        )
+
+
+@_windows_only
+def test_open_owner_only_redirect_blocker_regression(tmp_path) -> None:
+    """Regression for a real Windows finding: open_owner_only followed a
+    planted symlink to its target instead of refusing it.
+
+    Plain os.open() on Windows has no O_NOFOLLOW equivalent, so it silently
+    followed the link; a DACL applied afterward (restrict_fd_to_owner) then
+    landed on the target, not the intended file, and content written
+    through the "log" landed there too -- a real redirect, independently
+    reproduced, not a theoretical one. open_owner_only now opens through
+    headroom._fileperms_windows.open_no_follow instead, which refuses a
+    reparse point outright. Covers both modes open_owner_only supports:
+    append (what the proxy log actually uses) and truncate.
+    """
+    target = tmp_path / "ORIGINAL"
+    target.write_text("ORIGINAL", encoding="utf-8")
+    link = tmp_path / "log.txt"
+    _try_symlink(link, target)
+
+    with pytest.raises(OSError):
+        fileperms.open_owner_only(link, "a").close()
+    assert target.read_text(encoding="utf-8") == "ORIGINAL", "append mode wrote through the symlink"
+
+    with pytest.raises(OSError):
+        fileperms.open_owner_only(link, "w").close()
+    assert target.read_text(encoding="utf-8") == "ORIGINAL", (
+        "truncate mode wrote through the symlink"
+    )
+
+
+@_windows_only
+def test_runtime_log_refuses_a_symlinked_path_on_windows(tmp_path, monkeypatch) -> None:
+    """Windows counterpart of test_runtime_log_refuses_a_symlinked_path."""
+    from headroom.proxy.helpers import _PROXY_LOG_HANDLER_NAME, _setup_file_logging
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+    log_path = _paths.proxy_log_path(18814)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    elsewhere = tmp_path / "attacker-readable.log"
+    elsewhere.write_text("", encoding="utf-8")
+    _try_symlink(log_path, elsewhere)
+
+    headroom_logger = logging.getLogger("headroom")
+    before = list(headroom_logger.handlers)
+    try:
+        _setup_file_logging(18814)
+        attached = [h for h in headroom_logger.handlers if h.name == _PROXY_LOG_HANDLER_NAME]
+        assert not attached, "logging was wired up through the symlink"
+        logging.getLogger("headroom").info("a record that must not be written")
+    finally:
+        for handler in list(headroom_logger.handlers):
+            if handler not in before:
+                headroom_logger.removeHandler(handler)
+                handler.close()
+
+    assert elsewhere.read_text(encoding="utf-8") == ""
+
+
 @_posix_only
 def test_jsonl_request_log_is_owner_only(tmp_path, predictable_umask) -> None:
     """``--log-file`` with ``--log-messages`` writes whole bodies to this file."""
