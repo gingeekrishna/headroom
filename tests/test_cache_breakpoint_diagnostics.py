@@ -370,6 +370,51 @@ def test_pre_existing_backups_are_tightened_when_the_handler_opens(
     assert stat.S_IMODE(stale.stat().st_mode) == 0o600
 
 
+_windows_only = pytest.mark.skipif(
+    os.name != "nt",
+    reason="exercises the Windows ACL path specifically",
+)
+
+
+@_windows_only
+def test_runtime_log_is_owner_only_via_acl_with_previews_off(tmp_path, monkeypatch) -> None:
+    """Windows counterpart of test_runtime_log_is_owner_only_with_previews_off.
+
+    Same scenario, checked with verify_owner_only (the DACL) instead of
+    stat.S_IMODE (mode bits do not apply on Windows either way).
+    """
+    monkeypatch.delenv("HEADROOM_LOG_PAYLOAD_PREVIEW", raising=False)
+    with _proxy_log(tmp_path, monkeypatch, 18812) as log_path:
+        assert log_path.exists()
+        assert fileperms.verify_owner_only(log_path) is True
+
+
+@_windows_only
+def test_rotated_backups_are_owner_only_via_acl(tmp_path, monkeypatch) -> None:
+    """Windows counterpart of test_rotated_backups_are_owner_only.
+
+    Rotation must not launder the restriction away there either: doRollover
+    renames the base file (the DACL moves with the rename, same as a POSIX
+    rename preserves mode bits) and opens a fresh one that must be
+    independently restricted.
+    """
+    monkeypatch.delenv("HEADROOM_LOG_PAYLOAD_PREVIEW", raising=False)
+    with _proxy_log(tmp_path, monkeypatch, 18813) as log_path:
+        handler = next(
+            h for h in logging.getLogger("headroom").handlers if h.name == "headroom.proxy.file"
+        )
+        handler.maxBytes = 256
+        for i in range(60):
+            handler.emit(
+                logging.LogRecord("headroom", logging.INFO, __file__, i, "x" * 64, None, None)
+            )
+        handler.flush()
+        backups = sorted(log_path.parent.glob(f"{log_path.name}.*"))
+        assert backups, "no rollover happened — the test did not exercise the path it claims to"
+        for path in [log_path, *backups]:
+            assert fileperms.verify_owner_only(path) is True, path
+
+
 @pytest.mark.skipif(
     os.name != "posix",
     reason="creating a symlink needs elevation on Windows, and O_NOFOLLOW does not exist there",
@@ -465,31 +510,45 @@ def test_owner_only_support_matches_what_the_platform_can_enforce() -> None:
 
 @pytest.mark.skipif(
     fileperms.OWNER_ONLY_SUPPORTED,
-    reason="asserts the *absence* of the mode guarantee; only meaningful off POSIX",
+    reason="exercises the non-mode-bits path; only meaningful off POSIX",
 )
-def test_no_owner_only_claim_is_made_off_posix(tmp_path) -> None:
-    """On Windows the handler still logs — it just does not claim 0600."""
+def test_windows_acl_restricts_even_though_mode_bits_do_not(tmp_path) -> None:
+    """On Windows the handler still logs, and is restricted by ACL, not mode.
+
+    ``OWNER_ONLY_SUPPORTED`` (mode bits decide access) stays ``False`` here —
+    that is still true, Windows mode bits never controlled read access. What
+    changed is that :func:`restrict_path_to_owner` no longer gives up just
+    because mode bits do not apply: it restricts the DACL instead, and
+    :func:`verify_owner_only` confirms it by re-reading that DACL rather than
+    trusting the call's own return value.
+    """
     log_path = tmp_path / "proxy-18808.log"
     handler = _OwnerOnlyRotatingFileHandler(
         log_path, maxBytes=1024, backupCount=1, encoding="utf-8"
     )
     handler.close()
 
-    assert log_path.exists(), "logging must keep working where hardening cannot"
-    assert fileperms.restrict_path_to_owner(log_path) is False
+    assert log_path.exists(), "logging must keep working regardless of the ACL outcome"
+    assert fileperms.restrict_path_to_owner(log_path) is True
+    assert fileperms.verify_owner_only(log_path) is True
 
 
 def test_unsupported_platform_says_so_rather_than_silently_not_protecting(
     tmp_path, monkeypatch
 ) -> None:
-    """Simulates the Windows path on any host, since CI cannot be both.
+    """Covers the case where no protection mechanism works at all — mode bits
+    don't apply (as on Windows) and, simulated here via ``verify_owner_only``,
+    neither does the ACL call (a non-NTFS volume, a missing privilege). Runs
+    on every platform: POSIX gets there because ``verify_owner_only`` is
+    forced to report failure directly; Windows can get there for real.
 
-    A control that quietly does nothing on a supported platform is the thing
-    to avoid, so the operator is told once per process.
+    A control that quietly does nothing is the thing to avoid, so the
+    operator is told once per process.
     """
     from headroom.proxy import helpers as _helpers
 
     monkeypatch.setattr(fileperms, "OWNER_ONLY_SUPPORTED", False)
+    monkeypatch.setattr(fileperms, "verify_owner_only", lambda path: False)
     monkeypatch.setattr(_helpers, "_owner_only_warning_emitted", False)
     monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
 
@@ -510,9 +569,9 @@ def test_unsupported_platform_says_so_rather_than_silently_not_protecting(
                 handler.close()
 
     warnings = [r for r in records if r.levelno == logging.WARNING]
-    assert warnings, "the unsupported platform was not reported at all"
+    assert warnings, "the unprotected file was not reported at all"
     message = warnings[0].getMessage()
-    assert "owner-only" in message
+    assert "could not restrict" in message
     assert "proxy-18809.log" in message
     # And only once per process, so it is a notice and not a per-worker flood.
     assert _helpers._owner_only_warning_emitted is True
